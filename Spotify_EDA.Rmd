@@ -1,0 +1,114 @@
+---
+title: "Spotify EDA"
+author: "Andrew Couch"
+date: "3/24/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(spotifyr)
+
+token <- read_csv("spotify.csv")
+
+Sys.setenv(SPOTIFY_CLIENT_ID = token$Client_ID)
+Sys.setenv(SPOTIFY_CLIENT_SECRET = token$Client_Secret)
+
+access_token <- get_spotify_access_token()
+```
+
+
+```{r}
+user1 <- get_my_top_artists_or_tracks(type = 'tracks', time_range = 'long_term', limit = 50) %>% 
+  select(artists, duration_ms, name, popularity, id) %>% 
+  mutate(artists = map_chr(artists, ~pluck(.x, "name"))) %>% 
+  arrange(popularity) %>% 
+  mutate(audio_features = map(id, ~get_track_audio_features(.x) %>% select(-type, -id, -uri, -track_href, -analysis_url, -duration_ms))) %>% 
+  unnest(audio_features) %>% 
+  mutate(across(c(key, mode, time_signature), .fns = as.factor))
+
+user2 <- user1 %>% slice_sample(prop = 0.5)
+user1 <- setdiff(user1, user2)
+
+user1 <- user1 %>% 
+  mutate(popularity = dense_rank(desc(popularity)),
+         weight = duration_ms * popularity) %>% 
+  select(-duration_ms, -popularity, -key, -mode, -time_signature) %>% 
+  select(id, artists, name, weight, everything()) 
+
+user2 <- user2 %>% 
+  mutate(popularity = dense_rank(desc(popularity)),
+         weight = duration_ms * popularity) %>% 
+  select(-duration_ms, -popularity,  -key, -mode, -time_signature) %>% 
+  select(id, artists, name, weight, everything()) 
+```
+
+```{r}
+rec <- recipe(~., data = user1) %>% 
+    step_range(all_numeric(), -weight) %>% 
+    prep() 
+```
+
+```{r}
+user1 <- rec %>% 
+  juice() 
+user2 <- user2 %>% 
+  select(id, artists, name) %>% 
+  bind_cols(rec %>% bake(user2) %>% select(-id, -artists, -name))
+```
+
+
+
+```{r}
+# Song from each other songs
+user2 %>% 
+  pivot_longer(-c(id, artists, name, weight), names_to = "fields") %>% 
+  left_join(user1 %>% 
+              summarise(across(-c(id, artists, name, weight), mean)) %>% 
+              pivot_longer(everything(), values_to = "value2"),
+            by = c("fields" = "name")) %>% 
+  mutate(measurement = value*value2) %>% 
+  group_by(id, artists, name, weight) %>% 
+  summarise(dist = sum(measurement) / sqrt(sum(value^2) * sum(value2&2))) %>% 
+  ungroup() %>% 
+  mutate(metric = log10(weight) / dist) %>% 
+  slice_max(metric, n = 1)
+
+user1 %>% 
+  pivot_longer(-c(id, artists, name, weight), names_to = "fields") %>% 
+  left_join(user2 %>% 
+              summarise(across(-c(id, artists, name, weight), mean)) %>% 
+              pivot_longer(everything(), values_to = "value2"),
+            by = c("fields" = "name")) %>% 
+  mutate(measurement = value*value2) %>% 
+  group_by(id, artists, name, weight) %>% 
+  summarise(dist = sum(measurement) / sqrt(sum(value^2) * sum(value2&2))) %>% 
+  ungroup() %>% 
+  mutate(metric = log10(weight) / dist) %>% 
+  slice_max(metric, n = 1)
+```
+
+
+
+
+```{r}
+# Recommended playlist for both users (not listened to)
+both_rec <- get_recommendations_all(bind_rows(
+  user1 %>% select(id),
+  user2 %>% select(id)
+) %>% 
+  pluck("id")) %>% 
+  select(song_id = id, song_name = name, album_name = album.name, popularity, artists) %>% 
+  unnest(artists) %>% 
+  select(song_id, artist_name = name, song_name, album_name, popularity) %>% 
+  arrange(popularity) %>% 
+  mutate(audio_features = map(song_id, ~get_track_audio_features(.x) %>% select(-type, -id, -uri, -track_href, -analysis_url, -duration_ms))) %>% 
+  unnest(audio_features)
+```
+
+
